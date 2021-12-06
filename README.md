@@ -1,2 +1,2 @@
-# kvlogdb
-Paxos based RDBMS Table to be used as a version KV database or and Ordered log
+# Paxos Table 
+Paxos based SQL/RDBMS Table to be used as a KV store and/or an Ordered log

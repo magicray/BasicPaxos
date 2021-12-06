@@ -4,9 +4,9 @@ import argparse
 import sqlalchemy
 
 
-def paxos(db_engines, key, version, value):
+def paxos(databases, key, version, value):
     seq = int(time.time())                 # Paxos Seq
-    quorum = int(len(db_engines)/2) + 1    # Quorum
+    quorum = int(len(databases)/2) + 1    # Quorum
 
     def shuffle(inlist):
         # Pick servers in random order to invokde as many conflicts
@@ -14,57 +14,47 @@ def paxos(db_engines, key, version, value):
         random.shuffle(inlist)
         return inlist
 
-    def get_seq(conn, key, version):
-        # Non null rowid means a row exists
-        # promised_seq and accepted_seq are the key elements in PAXOS
-        rows = conn.execute('''select rowid, promised_seq, accepted_seq
-                               from kvlog
-                               where key=? and version=?
-                            ''', key, version)
-        rows = list(rows)
-
-        return rows[0] if rows else (None, 0, 0)
-
     # Promise Phase
     success = list()
-    for engine in shuffle(db_engines):
-        with engine.begin() as conn:
-            rowid, promised_seq, accepted_seq = get_seq(conn, key, version)
+    for db in shuffle(databases):
+        with db.connect() as conn:
+            trans = conn.begin()
+
+            rows = list(conn.execute('''select rowid, promised_seq,
+                                               accepted_seq, value
+                                        from kvlog
+                                        where key=? and version=?
+                                     ''', key, version))
 
             # A row for this key,version exists
-            if rowid is not None:
+            if rows:
                 # Value for this key,version is already learned
-                if promised_seq is None and accepted_seq is None:
-                    return 'already-learned', 0
+                if rows[0][1] is None and rows[0][2] is None:
+                    return 'already-learned', rows[0][3]
 
                 # Another, more recent, paxos round is in progress. Back out.
-                if promised_seq >= seq:
+                if rows[0][1] >= seq:
                     continue
 
-            if rowid is None:
-                # Insert a row for this key,version as none exists
-                conn.execute('''insert into kvlog(key,version,promised_seq)
-                                values(?,?,?)
-                             ''', key, version, seq)
-            else:
                 # A row exists and has a lower promised_seq than seq
                 # we can participate in this round.
                 #
                 # To reject any PAXOS round having seq less than this,
                 # need to record the current seq
                 conn.execute('update kvlog set promised_seq=? where rowid=?',
-                             seq, rowid)
+                             seq, rows[0][0])
 
-            if accepted_seq:
-                # This node accepted a value in a previous paxos round,
-                # return this value as required by PAXOS
-                rows = conn.execute('select value from kvlog where rowid=?',
-                                    rowid)
-                success.append((accepted_seq, list(rows)[0][0]))
+                accept_seq, value = rows[0][2], rows[0][3]
             else:
-                # Though this node participated in a (or many) previous paxos
-                # rounds, it never reached the accept phase
-                success.append((0, None))
+                # Insert a row for this key,version as none exists
+                conn.execute('''insert into kvlog
+                                (key,version,promised_seq)
+                                values(?,?,?)
+                             ''', key, version, seq)
+                accept_seq, value = 0, None
+
+            trans.commit()
+            success.append((0 if accept_seq is None else accept_seq, value))
 
     if len(success) < quorum:
         return 'no-promise-quorum', len(success)
@@ -80,40 +70,47 @@ def paxos(db_engines, key, version, value):
 
     # Accept Phase
     success = list()
-    for engine in shuffle(db_engines):
-        with engine.begin() as conn:
-            rowid, promised_seq, accepted_seq = get_seq(conn, key, version)
+    for db in shuffle(databases):
+        with db.begin() as conn:
+            trans = conn.begin()
+
+            rows = list(conn.execute('''select rowid, promised_seq from kvlog
+                                        where key=? and version=?
+                                     ''', key, version))
 
             # Back out as this node has already particiapted
             # in a more recent paxos round
-            if rowid is not None and promised_seq > seq:
+            if rows and rows[0][1] > seq:
                 continue
 
-            if rowid is None:
-                # This node is participating in paxos round for this
-                # key,version for the first time. Lets insert in new row.
-                conn.execute('''insert into kvlog(key,version,promised_seq,
-                                                  accepted_seq,value)
-                                values(?,?,?,?,?)
-                             ''', key, version, seq, seq, proposal[1])
-            else:
+            if rows:
                 # Though this node participated in earlier PAXOS rounds,
                 # this is the most recent one. Lets accept this value
                 # and promise to ignore any older rounds (seq values)
                 # in future
-                conn.execute('''update kvlog set promised_seq=?,
-                                                 accepted_seq=?, value=?
+                conn.execute('''update kvlog
+                                set promised_seq=?, accepted_seq=?, value=?
                                 where rowid=?
-                             ''', seq, seq, proposal[1], rowid)
+                             ''', seq, seq, proposal[1], rows[0][0])
+            else:
+                # This node is participating in paxos round for this
+                # key,version for the first time. Lets insert in new row.
+                conn.execute('''insert into kvlog
+                                  (key,version,promised_seq,accepted_seq,value)
+                                values(?,?,?,?,?)
+                             ''', key, version, seq, seq, proposal[1])
 
+            trans.commit()
             success.append(True)
 
     if len(success) < quorum:
         return 'no-accept-quorum', len(success)
 
     # Learn Phase
-    for engine in shuffle(db_engines):
-        with engine.begin() as conn:
+    for db in shuffle(databases):
+        with db.begin() as conn:
+            trans = conn.begin()
+
             # promised_seq = accepted_seq = null means the value
             # for this key,version pair has been learned
 
@@ -134,22 +131,23 @@ def paxos(db_engines, key, version, value):
                             where key=? and version=? and
                             value is not null and
                             promised_seq=? and accepted_seq=?
-                    ''', key, version, seq, seq)
+                         ''', key, version, seq, seq)
 
             # We should now have exactly one row for this key,version pair,
             # with value column set to something non null.
             #
             # promised_seq and accepted_seq should be null to indicate that
             # this value is finalized
-            rows = conn.execute('''select count(*) from kvlog
-                              where key=? and version=? and
-                                    value is not null and
-                                    promised_seq is null and
-                                    accepted_seq is null
-                           ''', key, version)
+            count = list(conn.execute('''select count(*) from kvlog
+                                         where key=? and version=? and
+                                         value is not null and
+                                         promised_seq is null and
+                                         accepted_seq is null
+                                      ''', key, version))[0][0]
+            trans.commit()
 
             # This node learned this value if there was exactly one row
-            if 1 == list(rows)[0][0]:
+            if 1 == count:
                 success.append(True)
 
     if len(success) < quorum:
