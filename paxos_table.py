@@ -5,11 +5,11 @@ import sqlalchemy
 
 
 def paxos(databases, key, version, value):
-    seq = int(time.time())                 # Paxos Seq
+    seq = int(time.time())                # Paxos Seq
     quorum = int(len(databases)/2) + 1    # Quorum
 
     def shuffle(inlist):
-        # Pick servers in random order to invokde as many conflicts
+        # Pick servers in random order to invoke as many conflicts
         # This helps us find out any corner cases quickly
         random.shuffle(inlist)
         return inlist
@@ -17,7 +17,8 @@ def paxos(databases, key, version, value):
     # Promise Phase
     success = list()
     for db in shuffle(databases):
-        with db.connect() as conn:
+        try:
+            conn = db.connect()
             trans = conn.begin()
 
             rows = list(conn.execute('''select rowid, promised_seq,
@@ -44,17 +45,21 @@ def paxos(databases, key, version, value):
                 conn.execute('update kvlog set promised_seq=? where rowid=?',
                              seq, rows[0][0])
 
-                accept_seq, value = rows[0][2], rows[0][3]
+                result = rows[0][2] if rows[0][2] else 0, rows[0][3]
             else:
                 # Insert a row for this key,version as none exists
                 conn.execute('''insert into kvlog
                                 (key,version,promised_seq)
                                 values(?,?,?)
                              ''', key, version, seq)
-                accept_seq, value = 0, None
+                result = 0, None
 
             trans.commit()
-            success.append((0 if accept_seq is None else accept_seq, value))
+            conn.close()
+
+            success.append(result)
+        except Exception:
+            pass
 
     if len(success) < quorum:
         return 'no-promise-quorum', len(success)
@@ -71,7 +76,8 @@ def paxos(databases, key, version, value):
     # Accept Phase
     success = list()
     for db in shuffle(databases):
-        with db.begin() as conn:
+        try:
+            conn = db.connect()
             trans = conn.begin()
 
             rows = list(conn.execute('''select rowid, promised_seq from kvlog
@@ -101,14 +107,19 @@ def paxos(databases, key, version, value):
                              ''', key, version, seq, seq, proposal[1])
 
             trans.commit()
+            conn.close()
+
             success.append(True)
+        except Exception:
+            pass
 
     if len(success) < quorum:
         return 'no-accept-quorum', len(success)
 
     # Learn Phase
     for db in shuffle(databases):
-        with db.begin() as conn:
+        try:
+            conn = db.connect()
             trans = conn.begin()
 
             # promised_seq = accepted_seq = null means the value
@@ -145,28 +156,32 @@ def paxos(databases, key, version, value):
                                          accepted_seq is null
                                       ''', key, version))[0][0]
             trans.commit()
+            conn.close()
 
-            # This node learned this value if there was exactly one row
+            # Node successfully learned this value if there was exactly one row
             if 1 == count:
                 success.append(True)
+        except Exception:
+            pass
 
     if len(success) < quorum:
         return 'no-learn-quorum', len(success)
 
-    return ('ok' if proposal[0] == 0 else 'updated', version)
+    if 0 == proposal[0]:
+        return 'ok', None
+
+    return 'resolved', proposal[1]
 
 
-class Table():
+class PaxosTable():
     def __init__(self, servers):
-        self.meta = dict()
-        self.tables = dict()
         self.engines = dict()
         self.servers = servers
 
         for s in self.servers:
-            self.meta[s] = sqlalchemy.MetaData()
-            self.tables[s] = sqlalchemy.Table(
-                'kvlog', self.meta[s],
+            meta = sqlalchemy.MetaData()
+            sqlalchemy.Table(
+                'kvlog', meta,
                 sqlalchemy.Column('rowid', sqlalchemy.Integer,
                                   primary_key=True, autoincrement=True),
                 sqlalchemy.Column('promised_seq', sqlalchemy.Integer),
@@ -176,13 +191,10 @@ class Table():
                 sqlalchemy.Column('value', sqlalchemy.LargeBinary))
 
             self.engines[s] = sqlalchemy.create_engine(s)
-            self.meta[s].create_all(self.engines[s])
+            meta.create_all(self.engines[s])
 
     def put(self, key, version, value):
         return paxos(list(self.engines.values()), key, version, value)
-
-    def append(self, topic, value):
-        return None
 
     def get(self, key):
         success = list()
@@ -228,11 +240,11 @@ if '__main__' == __name__:
     with open(ARGS.servers) as fd:
         ARGS.servers = [s.strip() for s in fd.read().split('\n') if s.strip()]
 
-    tab = Table(ARGS.servers)
+    ptab = PaxosTable(ARGS.servers)
 
     if ARGS.value and ARGS.version:
-        print(tab.put(ARGS.key, ARGS.version, ARGS.value.encode()))
+        print(ptab.put(ARGS.key, ARGS.version, ARGS.value.encode()))
     elif ARGS.value:
-        print(tab.put(ARGS.key, ARGS.value.encode()))
+        print(ptab.append(ARGS.key, ARGS.value.encode()))
     else:
-        print(tab.get(ARGS.key))
+        print(ptab.get(ARGS.key))

@@ -1,2 +1,2 @@
-# Paxos Table 
-Paxos based SQL/RDBMS Table to be used as a KV store and/or an Ordered log
+# PaxosTable 
+Paxos consensus based multi server SQL table. It provides a fault tolerant and strongly consistent Ordered Log and/or a KV store supporting atomic read-update for a single key.
