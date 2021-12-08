@@ -1,17 +1,18 @@
+import sys
 import time
 import random
-import argparse
 import sqlalchemy
 
 
 def paxos(conns, quorum, key, version, value):
-    seq = int(time.time())            # Paxos Seq
+    seq = int(time.time())  # Paxos Seq
 
     # Promise Phase
     success = list()
     random.shuffle(conns)
     for conn in conns:
         try:
+            # Insert a row, if does not exist already
             conn.execute('''insert into kvlog
                             (key,version,promised_seq,accepted_seq)
                             values(?,?,0,0)
@@ -22,28 +23,27 @@ def paxos(conns, quorum, key, version, value):
         try:
             trans = conn.begin()
 
+            # Get the information from the old paxos round
             promised_seq, accepted_seq, accepted_value = list(
                 conn.execute('''select promised_seq,accepted_seq,value
                                 from kvlog
                                 where key=? and version=?
                              ''', key, version))[0]
 
-            if promised_seq is None and accepted_seq is None:
-                return 'already-learned', accepted_value
-
-            # Another, more recent, paxos round already started,
-            # Reject this round
+            # A more recent paxos round has been seen by this node.
+            # It should not participate in this round.
             if promised_seq >= seq:
+                trans.rollback()
                 continue
 
-            # To reject any unfinished older PAXOS rounds having seq less
-            # than this, record the current seq
+            # Record seq to reject any old stray paxos rounds
             conn.execute('''update kvlog set promised_seq=?
                             where key=? and version=?
                          ''', seq, key, version)
 
             trans.commit()
 
+            # This information is used by paxos to decide the proposal value
             success.append((accepted_seq, accepted_value))
         except Exception:
             pass
@@ -53,7 +53,7 @@ def paxos(conns, quorum, key, version, value):
 
     # This is the most subtle PAXOS step
     #
-    # Lets find the most recent value accepted by nodes in the ACCEPT phase
+    # Find the most recent value accepted by nodes in the ACCEPT phase
     # of previous incomplete PAXOS rounds
     proposal = (0, value)
     for accepted_seq, value in success:
@@ -65,14 +65,16 @@ def paxos(conns, quorum, key, version, value):
     random.shuffle(conns)
     for conn in conns:
         try:
-            # Accept this proposal
-            # promised_seq == accepted_seq == seq ensures that this row
-            # participated in the current paxos round.
-            result = conn.execute('''update kvlog
-                                     set accepted_seq=?, value=?
-                                     where key=? and version=? and
-                                           promised_seq=?
-                                  ''', seq, proposal[1], key, version, seq)
+            # Accept this proposal, iff, this node participated in the
+            # promise phase of this round. promised_seq == seq.
+            #
+            # This is stricter implementation than standard paxos
+            # Paxos would allow if seq >= promised_seq, but we don't allow
+            # to minimize testing effort for this valid, but rare case.
+            result = conn.execute(
+                '''update kvlog set accepted_seq=?, value=?
+                   where key=? and version=? and promised_seq=?
+                ''', seq, proposal[1], key, version, seq)
 
             if 1 == result.rowcount:
                 success.append(True)
@@ -88,16 +90,27 @@ def paxos(conns, quorum, key, version, value):
     random.shuffle(conns)
     for conn in conns:
         try:
-            # Finalize this row by setting promised_seq = accepted_seq = null
-            # promised_seq == accepted_seq == seq ensures that this row
-            # participated in the current paxos round.
-            result = conn.execute('''update kvlog
-                                     set promised_seq=?, accepted_seq=null
-                                     where key=? and version=? and
-                                           value is not null and
-                                           promised_seq=? and accepted_seq=?
-                                  ''', None, key, version, seq, seq)
+            trans = conn.begin()
 
+            # Old versions of this key are not needed anymore
+            conn.execute('delete from kvlog where key=? and version < ?',
+                         key, version)
+
+            # Mark this value as learned, iff, this node participated in both
+            # the promise and accept phase of this round.
+            # promised_seq == accepted_seq == seq.
+            #
+            # Paxos would accept a value without any check. But we don't as
+            # we don't even send any value in this phase. We just mark the
+            # value accepted in ACCEPT phase as learned, and hence we need
+            # the check to ensure this node participated in the promise/accept
+            result = conn.execute(
+                '''update kvlog set promised_seq=null, accepted_seq=null
+                   where key=? and version=? and value is not null and
+                         promised_seq=? and accepted_seq=?
+                ''', key, version, seq, seq)
+
+            trans.commit()
             if 1 == result.rowcount:
                 success.append(True)
 
@@ -107,18 +120,23 @@ def paxos(conns, quorum, key, version, value):
     if len(success) < quorum:
         return 'no-learn-quorum', len(success)
 
+    # This paxos round completed successfully and our proposed value
+    # got accepted and learned.
     if 0 == proposal[0]:
         return 'ok', version
 
+    # Well, the paxos round completed and a value was learned for this
+    # key,version. But it was not our value. It was a value picked from
+    # response we got from all the nodes in the promise phase.
     return 'resolved', proposal[1]
 
 
 class PaxosTable():
     def __init__(self, servers):
+        self.quorum = int(len(servers)/2) + 1  # A simple majority
         self.engines = dict()
-        self.servers = servers
 
-        for s in self.servers:
+        for s in servers:
             meta = sqlalchemy.MetaData()
             sqlalchemy.Table(
                 'kvlog', meta,
@@ -135,10 +153,6 @@ class PaxosTable():
             meta.create_all(self.engines[s])
 
     def put(self, key, version, value):
-        # These many nodes should agree before
-        # an operation is considered successful
-        quorum = int(len(self.engines)/2) + 1
-
         conns = list()
         for engine in self.engines.values():
             try:
@@ -146,81 +160,76 @@ class PaxosTable():
             except Exception:
                 pass
 
-        if version is None:
-            versions = list()
-            random.shuffle(conns)
-            for conn in conns:
-                try:
-                    trans = conn.begin()
-                    v = list(conn.execute('''select max(version)
-                                             from kvlog where key=?
-                                          ''', key))[0][0]
-                    v = v+1 if v else 1
-                    conn.execute('''insert into kvlog
-                                    (key,version,promised_seq,accepted_seq)
-                                    values(?,?,0,0)
-                                 ''', key, v)
-                    trans.commit()
-                    versions.append(v)
-                except Exception:
-                    pass
-
-            version = max(versions)
-
         try:
-            return paxos(conns, quorum, key, version, value)
+            return paxos(conns, self.quorum, key, version, value)
         finally:
             [conn.close() for conn in conns]
 
-    def get(self, key, version=None):
-        success = list()
+    def get(self, key):
+        conns = list()
         for engine in self.engines.values():
-            with engine.begin() as conn:
-                rows = list(conn.execute('''select version from kvlog
-                                            where key=? and
-                                                  promised_seq is null and
-                                                  accepted_seq is null
-                                            order by version desc
-                                            limit 1
-                                         ''', key))
-                if rows:
-                    success.append((engine, rows[0][0]))
+            try:
+                conns.append(engine.connect())
+            except Exception:
+                pass
 
-        if len(success) < int(len(self.engines)/2) + 1:
-            return 'no-quorum', len(success), None
+        versions = list()
+        random.shuffle(conns)
+        for conn in conns:
+            try:
+                versions.append(list(conn.execute(
+                    '''select version from kvlog
+                       where key=? and
+                             promised_seq is null and
+                             accepted_seq is null
+                       order by version desc limit 1
+                    ''', key))[0][0])
+            except Exception:
+                pass
 
-        version = max([v for e, v in success])
-        for engine, v in success:
-            if v != version:
-                continue
+        if len(versions) < self.quorum:
+            return 'no-quorum', len(versions), None
 
-            with engine.begin() as conn:
-                rows = conn.execute('''select value from kvlog
-                                       where key=? and version=? and
-                                             promised_seq is null and
-                                             accepted_seq is null
-                                    ''', key, version)
+        version = max(versions)
 
-                return 'ok', version, list(rows)[0][0]
+        random.shuffle(conns)
+        for conn in conns:
+            try:
+                return 'ok', version, list(conn.execute(
+                    '''select value from kvlog
+                       where key=? and version=? and
+                             promised_seq is null and
+                             accepted_seq is null
+                    ''', key, version))[0][0]
+            except Exception:
+                pass
 
 
 if '__main__' == __name__:
-    ARGS = argparse.ArgumentParser()
+    with open(sys.argv[1]) as fd:
+        servers = [s.strip() for s in fd.read().split('\n') if s.strip()]
 
-    ARGS.add_argument('--key', dest='key')
-    ARGS.add_argument('--value', dest='value')
-    ARGS.add_argument('--version', dest='version', type=int)
+    ptab = PaxosTable(servers)
 
-    ARGS.add_argument('--servers', dest='servers')
-    ARGS = ARGS.parse_args()
-    with open(ARGS.servers) as fd:
-        ARGS.servers = [s.strip() for s in fd.read().split('\n') if s.strip()]
+    if 5 == len(sys.argv):
+        key, version, value = sys.argv[2:]
 
-    ptab = PaxosTable(ARGS.servers)
+        status, version = ptab.put(key, int(version), value.encode())
 
-    if ARGS.value and ARGS.version:
-        print(ptab.put(ARGS.key, ARGS.version, ARGS.value.encode()))
-    elif ARGS.value:
-        print(ptab.put(ARGS.key, None, ARGS.value.encode()))
-    else:
-        print(ptab.get(ARGS.key))
+        print('{}: {}'.format(status, version))
+    if 4 == len(sys.argv):
+        key, version = sys.argv[2:]
+
+        status, version = ptab.put(key, int(version), sys.stdin.buffer.read())
+
+        print('{}: {}'.format(status, version))
+    elif 3 == len(sys.argv):
+        key = sys.argv[2]
+
+        status, version, value = ptab.get(key)
+
+        print('{}: {}'.format(status, version))
+        if 'ok' == status:
+            sys.stdout.buffer.write(value)
+
+    exit(0 if 'ok' == status else 1)
