@@ -1,2 +1,2 @@
 # PaxosTable 
-An Ordered Log and a KV store with atomic updates. Using a SQL table for persistence and Paxos for replication.
+A strongly consistent Key Value store with atomic single key updates. Using a SQL table for persistence and Paxos for replication.
