@@ -5,6 +5,8 @@ import sqlalchemy
 
 
 def paxos(conns, quorum, key, version, value):
+    assert(version > 0)
+
     seq = int(time.time())  # Paxos Seq
 
     # Promise Phase
@@ -30,6 +32,10 @@ def paxos(conns, quorum, key, version, value):
                                 where key=? and version=?
                              ''', key, version))[0]
 
+            # Value for this key,version has already been learned
+            if promised_seq is None and accepted_seq is None:
+                return dict(status='already-learned', value=accepted_value)
+
             # A more recent paxos round has been seen by this node.
             # It should not participate in this round.
             if promised_seq >= seq:
@@ -49,7 +55,7 @@ def paxos(conns, quorum, key, version, value):
             pass
 
     if len(success) < quorum:
-        return 'no-promise-quorum', len(success)
+        return dict(status='no-promise-quorum', nodes=len(success))
 
     # This is the most subtle PAXOS step
     #
@@ -83,7 +89,7 @@ def paxos(conns, quorum, key, version, value):
             pass
 
     if len(success) < quorum:
-        return 'no-accept-quorum', len(success)
+        return dict(status='no-accept-quorum', nodes=len(success))
 
     # Learn Phase
     success = list()
@@ -118,118 +124,163 @@ def paxos(conns, quorum, key, version, value):
             pass
 
     if len(success) < quorum:
-        return 'no-learn-quorum', len(success)
+        return dict(status='no-learn-quorum', nodes=len(success))
 
     # This paxos round completed successfully and our proposed value
     # got accepted and learned.
     if 0 == proposal[0]:
-        return 'ok', version
+        return dict(status='ok', version=version)
 
     # Well, the paxos round completed and a value was learned for this
     # key,version. But it was not our value. It was a value picked from
     # response we got from all the nodes in the promise phase.
-    return 'resolved', proposal[1]
+    return dict(status='resolved', value=proposal[1])
 
 
 class PaxosTable():
     def __init__(self, servers):
         self.quorum = int(len(servers)/2) + 1  # A simple majority
         self.engines = dict()
+        self.conns = list()
 
         for s in servers:
             meta = sqlalchemy.MetaData()
             sqlalchemy.Table(
                 'kvlog', meta,
-                sqlalchemy.Column('rowid', sqlalchemy.Integer,
-                                  primary_key=True, autoincrement=True),
-                sqlalchemy.Column('promised_seq', sqlalchemy.Integer),
-                sqlalchemy.Column('accepted_seq', sqlalchemy.Integer),
                 sqlalchemy.Column('key', sqlalchemy.Text),
                 sqlalchemy.Column('version', sqlalchemy.Integer),
+                sqlalchemy.Column('promised_seq', sqlalchemy.Integer),
+                sqlalchemy.Column('accepted_seq', sqlalchemy.Integer),
                 sqlalchemy.Column('value', sqlalchemy.LargeBinary),
-                sqlalchemy.UniqueConstraint('key', 'version'))
+                sqlalchemy.PrimaryKeyConstraint('key', 'version'))
 
             self.engines[s] = sqlalchemy.create_engine(s)
             meta.create_all(self.engines[s])
 
-    def put(self, key, version, value):
-        conns = list()
-        for engine in self.engines.values():
-            try:
-                conns.append(engine.connect())
-            except Exception:
-                pass
+    def connect(self):
+        if not self.conns:
+            for engine in self.engines.values():
+                try:
+                    self.conns.append(engine.connect())
+                except Exception:
+                    pass
 
+        random.shuffle(self.conns)
+        return self.conns
+
+    def disconnect(self):
+        if self.conns:
+            [conn.close() for conn in self.conns]
+            self.conns = list()
+
+    def put(self, key, version, value):
         try:
-            return paxos(conns, self.quorum, key, version, value)
+            return paxos(self.connect(), self.quorum, key, version, value)
         finally:
-            [conn.close() for conn in conns]
+            self.disconnect()
 
     def get(self, key):
-        conns = list()
-        for engine in self.engines.values():
+        # Find out the latest version for this key on each node
+        versions = dict()
+        for conn in self.connect():
             try:
-                conns.append(engine.connect())
-            except Exception:
-                pass
-
-        versions = list()
-        random.shuffle(conns)
-        for conn in conns:
-            try:
-                versions.append(list(conn.execute(
+                v = list(conn.execute(
                     '''select version from kvlog
                        where key=? and
                              promised_seq is null and
                              accepted_seq is null
                        order by version desc limit 1
-                    ''', key))[0][0])
+                    ''', key))[0][0]
+
+                versions.setdefault(v, list()).append(conn)
             except Exception:
-                pass
+                versions.setdefault(0, list()).append(conn)
 
-        if len(versions) < self.quorum:
-            return 'no-quorum', len(versions), None
+        # Find out the latest version for this key on the cluster
+        version = max(versions.keys())
 
-        version = max(versions)
-
-        random.shuffle(conns)
-        for conn in conns:
+        # Read the value for the latest version of this key
+        for conn in versions[version]:
             try:
-                return 'ok', version, list(conn.execute(
+                value = list(conn.execute(
                     '''select value from kvlog
                        where key=? and version=? and
                              promised_seq is null and
                              accepted_seq is null
                     ''', key, version))[0][0]
+                break
             except Exception:
                 pass
 
+        # Some nodes don't have the latest version of the value for this key.
+        #
+        # It is important to ensure that the a mojority has the latest learned
+        # version. If that is not done, and the node with the latest learned
+        # value goes down, we might have to return an older version of the
+        # value and that wouldbreak the promise of being a strongly consistent
+        # KeyValue store.
+        for v, conn_list in versions.items():
+            if v == version:
+                continue
+
+            for conn in conn_list:
+                try:
+                    trans = conn.begin()
+                    conn.execute(
+                        '''delete from kvlog
+                           where key=? and version <= ?
+                        ''', key, version)
+                    result = conn.execute(
+                        '''insert into kvlog
+                           (key,version,promised_seq,accepted_seq,value)
+                           values(?,?,null,null,?)
+                        ''', key, version, value)
+                    trans.commit()
+
+                    if 1 == result.rowcount:
+                        versions[version].append(conn)
+                except Exception:
+                    pass
+
+        self.disconnect()
+
+        # We do not have a majority with the latest value
+        if len(versions[version]) < self.quorum:
+            return dict(status='no-quorum', replicas=len(versions[version]))
+
+        if version > 0:
+            return dict(status='ok', version=version,
+                        replicas=len(versions[version]),
+                        value=value)
+
+        return dict(status='not-found')
+
 
 if '__main__' == __name__:
-    with open(sys.argv[1]) as fd:
+    sys.argv.extend((None, None, None))
+    server_file, key, version, value = sys.argv[1:5]
+
+    with open(server_file) as fd:
         servers = [s.strip() for s in fd.read().split('\n') if s.strip()]
 
     ptab = PaxosTable(servers)
 
-    if 5 == len(sys.argv):
-        key, version, value = sys.argv[2:]
+    if value:
+        r = ptab.put(key, int(version), value.encode())
+        print(r, file=sys.stderr)
+    elif version:
+        r = ptab.put(key, int(version), sys.stdin.buffer.read())
+        print(r, file=sys.stderr)
+    elif key:
+        r = ptab.get(key)
 
-        status, version = ptab.put(key, int(version), value.encode())
+        print('status({}) version({}) replicas({})'.format(
+            r['status'], r.get('version', ''), r.get('replicas', '')),
+            file=sys.stderr)
 
-        print('{}: {}'.format(status, version))
-    if 4 == len(sys.argv):
-        key, version = sys.argv[2:]
+        if r.get('value', ''):
+            sys.stdout.buffer.write(r['value'])
+            sys.stdout.flush()
+            sys.stderr.write('\n')
 
-        status, version = ptab.put(key, int(version), sys.stdin.buffer.read())
-
-        print('{}: {}'.format(status, version))
-    elif 3 == len(sys.argv):
-        key = sys.argv[2]
-
-        status, version, value = ptab.get(key)
-
-        print('{}: {}'.format(status, version))
-        if 'ok' == status:
-            sys.stdout.buffer.write(value)
-
-    exit(0 if 'ok' == status else 1)
+    exit(0 if 'ok' == r['status'] else 1)
