@@ -180,80 +180,62 @@ class PaxosTable():
             self.disconnect()
 
     def get(self, key):
-        # Find out the latest version for this key on each node
-        versions = dict()
+        # Find out latest version for this key
+        version, value = 0, None
         for conn in self.connect():
             try:
-                v = list(conn.execute(
-                    '''select version from kvlog
-                       where key=? and
+                rows = list(conn.execute(
+                    '''select version, value from kvlog
+                       where key=? and version > ? and
                              promised_seq is null and
                              accepted_seq is null
                        order by version desc limit 1
-                    ''', key))[0][0]
-
-                versions.setdefault(v, list()).append(conn)
-            except Exception:
-                versions.setdefault(0, list()).append(conn)
-
-        # Find out the latest version for this key on the cluster
-        version = max(versions.keys())
-
-        # Read the value for the latest version of this key
-        for conn in versions[version]:
-            try:
-                value = list(conn.execute(
-                    '''select value from kvlog
-                       where key=? and version=? and
-                             promised_seq is null and
-                             accepted_seq is null
-                    ''', key, version))[0][0]
-                break
+                    ''', key, version))
+                if rows:
+                    version, value = rows[0]
             except Exception:
                 pass
 
-        # Some nodes don't have the latest version of the value for this key.
-        #
-        # It is important to ensure that the a mojority has the latest learned
-        # version. If that is not done, and the node with the latest learned
-        # value goes down, we might have to return an older version of the
-        # value and that wouldbreak the promise of being a strongly consistent
-        # KeyValue store.
-        for v, conn_list in versions.items():
-            if v == version:
-                continue
+        if 0 == version:
+            return dict(status='not-found')
 
-            for conn in conn_list:
-                try:
-                    trans = conn.begin()
-                    conn.execute(
-                        '''delete from kvlog
-                           where key=? and version <= ?
-                        ''', key, version)
-                    result = conn.execute(
-                        '''insert into kvlog
-                           (key,version,promised_seq,accepted_seq,value)
-                           values(?,?,null,null,?)
-                        ''', key, version, value)
-                    trans.commit()
+        # Update the node missing the latest version of the value
+        count = 0
+        for conn in self.connect():
+            try:
+                trans = conn.begin()
+                n = list(conn.execute('''select count(*) from kvlog
+                                         where key=? and version=? and
+                                               promised_seq is null and
+                                               accepted_seq is null
+                                      ''', key, version))[0][0]
+                if 1 == n:
+                    count += 1
+                    trans.rollback()
+                    continue
 
-                    if 1 == result.rowcount:
-                        versions[version].append(conn)
-                except Exception:
-                    pass
+                conn.execute('delete from kvlog where key=? and version<=?',
+                             key, version)
+                result = conn.execute(
+                    '''insert into kvlog
+                       (key,version,promised_seq,accepted_seq,value)
+                       values(?,?,null,null,?)
+                    ''', key, version, value)
+                trans.commit()
+
+                if 1 == result.rowcount:
+                    count += 1
+            except Exception:
+                pass
 
         self.disconnect()
 
         # We do not have a majority with the latest value
-        if len(versions[version]) < self.quorum:
-            return dict(status='no-quorum', replicas=len(versions[version]))
+        if count < self.quorum:
+            return dict(status='no-quorum', replicas=count)
 
-        if version > 0:
-            return dict(status='ok', version=version,
-                        replicas=len(versions[version]),
-                        value=value)
-
-        return dict(status='not-found')
+        # All good
+        return dict(status='ok', version=version, replicas=count, value=value)
 
 
 if '__main__' == __name__:
