@@ -16,7 +16,7 @@ def paxos(conns, quorum, key, version, value):
     for conn in conns:
         try:
             # Insert a row, if does not exist already
-            conn.execute('''insert into kvlog
+            conn.execute('''insert into paxos
                             (key,version,promised_seq,accepted_seq)
                             values(?,?,0,0)
                          ''', key, version)
@@ -29,7 +29,7 @@ def paxos(conns, quorum, key, version, value):
             # Get the information from the old paxos round
             promised_seq, accepted_seq, accepted_value = list(
                 conn.execute('''select promised_seq,accepted_seq,value
-                                from kvlog
+                                from paxos
                                 where key=? and version=?
                              ''', key, version))[0]
 
@@ -44,7 +44,7 @@ def paxos(conns, quorum, key, version, value):
                 continue
 
             # Record seq to reject any old stray paxos rounds
-            conn.execute('''update kvlog set promised_seq=?
+            conn.execute('''update paxos set promised_seq=?
                             where key=? and version=?
                          ''', seq, key, version)
 
@@ -79,7 +79,7 @@ def paxos(conns, quorum, key, version, value):
             # Paxos would allow if seq >= promised_seq, but we don't allow
             # to minimize testing effort for this valid, but rare case.
             result = conn.execute(
-                '''update kvlog set accepted_seq=?, value=?
+                '''update paxos set accepted_seq=?, value=?
                    where key=? and version=? and promised_seq=?
                 ''', seq, proposal[1], key, version, seq)
 
@@ -100,7 +100,7 @@ def paxos(conns, quorum, key, version, value):
             trans = conn.begin()
 
             # Old versions of this key are not needed anymore
-            conn.execute('delete from kvlog where key=? and version < ?',
+            conn.execute('delete from paxos where key=? and version < ?',
                          key, version)
 
             # Mark this value as learned, iff, this node participated in both
@@ -112,7 +112,7 @@ def paxos(conns, quorum, key, version, value):
             # value accepted in ACCEPT phase as learned, and hence we need
             # the check to ensure this node participated in the promise/accept
             result = conn.execute(
-                '''update kvlog set promised_seq=null, accepted_seq=null
+                '''update paxos set promised_seq=null, accepted_seq=null
                    where key=? and version=? and value is not null and
                          promised_seq=? and accepted_seq=?
                 ''', key, version, seq, seq)
@@ -144,7 +144,7 @@ def read(conns, quorum, key, cache_expiry):
     for conn in conns:
         try:
             rows = list(conn.execute(
-                '''select version, value from kvlog
+                '''select version, value from paxos
                    where key=? and version > ? and
                          promised_seq is null and
                          accepted_seq is null
@@ -163,7 +163,7 @@ def read(conns, quorum, key, cache_expiry):
     for conn in conns:
         try:
             trans = conn.begin()
-            n = list(conn.execute('''select count(*) from kvlog
+            n = list(conn.execute('''select count(*) from paxos
                                      where key=? and version=? and
                                            promised_seq is null and
                                            accepted_seq is null
@@ -173,10 +173,10 @@ def read(conns, quorum, key, cache_expiry):
                 trans.rollback()
                 continue
 
-            conn.execute('delete from kvlog where key=? and version<=?',
+            conn.execute('delete from paxos where key=? and version<=?',
                          key, version)
             result = conn.execute(
-                '''insert into kvlog
+                '''insert into paxos
                    (key,version,promised_seq,accepted_seq,value)
                    values(?,?,null,null,?)
                 ''', key, version, value)
@@ -204,7 +204,7 @@ class PaxosTable():
         for s in servers:
             meta = sqlalchemy.MetaData()
             sqlalchemy.Table(
-                'kvlog', meta,
+                'paxos', meta,
                 sqlalchemy.Column('key', sqlalchemy.Text),
                 sqlalchemy.Column('version', sqlalchemy.Integer),
                 sqlalchemy.Column('promised_seq', sqlalchemy.Integer),
