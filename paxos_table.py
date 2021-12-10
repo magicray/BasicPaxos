@@ -5,7 +5,8 @@ import sqlalchemy
 
 
 def paxos(conns, quorum, key, version, value):
-    assert(version > 0)
+    if not key or not value or version < 1:
+        return dict(status='invalid-input')
 
     seq = int(time.time())  # Paxos Seq
 
@@ -137,6 +138,63 @@ def paxos(conns, quorum, key, version, value):
     return dict(status='resolved', value=proposal[1])
 
 
+def read(conns, quorum, key, cache_expiry):
+    # Find out latest version for this key
+    version, value = 0, None
+    for conn in conns:
+        try:
+            rows = list(conn.execute(
+                '''select version, value from kvlog
+                   where key=? and version > ? and
+                         promised_seq is null and
+                         accepted_seq is null
+                   order by version desc limit 1
+                ''', key, version))
+            if rows:
+                version, value = rows[0]
+        except Exception:
+            pass
+
+    if 0 == version:
+        return dict(status='not-found')
+
+    # Update the node missing the latest version of the value
+    count = 0
+    for conn in conns:
+        try:
+            trans = conn.begin()
+            n = list(conn.execute('''select count(*) from kvlog
+                                     where key=? and version=? and
+                                           promised_seq is null and
+                                           accepted_seq is null
+                                  ''', key, version))[0][0]
+            if 1 == n:
+                count += 1
+                trans.rollback()
+                continue
+
+            conn.execute('delete from kvlog where key=? and version<=?',
+                         key, version)
+            result = conn.execute(
+                '''insert into kvlog
+                   (key,version,promised_seq,accepted_seq,value)
+                   values(?,?,null,null,?)
+                ''', key, version, value)
+            trans.commit()
+
+            if 1 == result.rowcount:
+                count += 1
+        except Exception:
+            pass
+
+    # We do not have a majority with the latest value
+    if count < quorum:
+        return dict(status='no-quorum', replicas=count)
+
+    # All good
+    return dict(status='ok', version=version, replicas=count, value=value)
+
+
 class PaxosTable():
     def __init__(self, servers):
         self.quorum = int(len(servers)/2) + 1  # A simple majority
@@ -180,65 +238,13 @@ class PaxosTable():
             self.disconnect()
 
     def get(self, key):
-        # Find out latest version for this key
-        version, value = 0, None
-        for conn in self.connect():
-            try:
-                rows = list(conn.execute(
-                    '''select version, value from kvlog
-                       where key=? and version > ? and
-                             promised_seq is null and
-                             accepted_seq is null
-                       order by version desc limit 1
-                    ''', key, version))
-                if rows:
-                    version, value = rows[0]
-            except Exception:
-                pass
-
-        if 0 == version:
-            return dict(status='not-found')
-
-        # Update the node missing the latest version of the value
-        count = 0
-        for conn in self.connect():
-            try:
-                trans = conn.begin()
-                n = list(conn.execute('''select count(*) from kvlog
-                                         where key=? and version=? and
-                                               promised_seq is null and
-                                               accepted_seq is null
-                                      ''', key, version))[0][0]
-                if 1 == n:
-                    count += 1
-                    trans.rollback()
-                    continue
-
-                conn.execute('delete from kvlog where key=? and version<=?',
-                             key, version)
-                result = conn.execute(
-                    '''insert into kvlog
-                       (key,version,promised_seq,accepted_seq,value)
-                       values(?,?,null,null,?)
-                    ''', key, version, value)
-                trans.commit()
-
-                if 1 == result.rowcount:
-                    count += 1
-            except Exception:
-                pass
-
-        self.disconnect()
-
-        # We do not have a majority with the latest value
-        if count < self.quorum:
-            return dict(status='no-quorum', replicas=count)
-
-        # All good
-        return dict(status='ok', version=version, replicas=count, value=value)
+        try:
+            return read(self.connect(), self.quorum, key, cache_expiry=30)
+        finally:
+            self.disconnect()
 
 
-if '__main__' == __name__:
+def main():
     sys.argv.extend((None, None, None))
     server_file, key, version, value = sys.argv[1:5]
 
@@ -266,3 +272,7 @@ if '__main__' == __name__:
             sys.stderr.write('\n')
 
     exit(0 if 'ok' == r['status'] else 1)
+
+
+if '__main__' == __name__:
+    main()
