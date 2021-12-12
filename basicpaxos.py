@@ -16,10 +16,10 @@ def paxos(conns, quorum, key, version, value):
     for conn in conns:
         try:
             # Insert a row, if does not exist already
-            conn.execute('''insert into paxos
-                            (key,version,promised_seq,accepted_seq)
-                            values(?,?,0,0)
-                         ''', key, version)
+            conn.execute(sqlalchemy.text(
+                '''insert into paxos(`key`,version,promised_seq,accepted_seq)
+                   values(:k,:v,0,0)
+                '''), dict(k=key, v=version))
         except Exception:
             pass
 
@@ -28,10 +28,10 @@ def paxos(conns, quorum, key, version, value):
 
             # Get the information from the old paxos round
             promised_seq, accepted_seq, accepted_value = list(
-                conn.execute('''select promised_seq,accepted_seq,value
-                                from paxos
-                                where key=? and version=?
-                             ''', key, version))[0]
+                conn.execute(sqlalchemy.text(
+                    '''select promised_seq,accepted_seq,value
+                       from paxos where `key`=:k and version=:v
+                    '''), dict(k=key, v=version)))[0]
 
             # Value for this key,version has already been learned
             if promised_seq is None and accepted_seq is None:
@@ -44,9 +44,10 @@ def paxos(conns, quorum, key, version, value):
                 continue
 
             # Record seq to reject any old stray paxos rounds
-            conn.execute('''update paxos set promised_seq=?
-                            where key=? and version=?
-                         ''', seq, key, version)
+            conn.execute(sqlalchemy.text(
+                '''update paxos set promised_seq=:s
+                   where `key`=:k and version=:v
+                '''), dict(s=seq, k=key, v=version))
 
             trans.commit()
 
@@ -78,10 +79,10 @@ def paxos(conns, quorum, key, version, value):
             # This is stricter implementation than standard paxos
             # Paxos would allow if seq >= promised_seq, but we don't allow
             # to minimize testing effort for this valid, but rare case.
-            result = conn.execute(
-                '''update paxos set accepted_seq=?, value=?
-                   where key=? and version=? and promised_seq=?
-                ''', seq, proposal[1], key, version, seq)
+            result = conn.execute(sqlalchemy.text(
+                '''update paxos set accepted_seq=:s, value=:val
+                   where `key`=:k and version=:ver and promised_seq=:s
+                '''), dict(s=seq, val=proposal[1], k=key, ver=version))
 
             if 1 == result.rowcount:
                 success.append(True)
@@ -100,8 +101,9 @@ def paxos(conns, quorum, key, version, value):
             trans = conn.begin()
 
             # Old versions of this key are not needed anymore
-            conn.execute('delete from paxos where key=? and version < ?',
-                         key, version)
+            conn.execute(sqlalchemy.text(
+                'delete from paxos where `key`=:k and version < :v'),
+                dict(k=key, v=version))
 
             # Mark this value as learned, iff, this node participated in both
             # the promise and accept phase of this round.
@@ -111,11 +113,11 @@ def paxos(conns, quorum, key, version, value):
             # we don't even send any value in this phase. We just mark the
             # value accepted in ACCEPT phase as learned, and hence we need
             # the check to ensure this node participated in the promise/accept
-            result = conn.execute(
+            result = conn.execute(sqlalchemy.text(
                 '''update paxos set promised_seq=null, accepted_seq=null
-                   where key=? and version=? and value is not null and
-                         promised_seq=? and accepted_seq=?
-                ''', key, version, seq, seq)
+                   where `key`=:k and version=:v and value is not null and
+                         promised_seq=:s and accepted_seq=:s
+                '''), dict(k=key, v=version, s=seq))
 
             trans.commit()
             if 1 == result.rowcount:
@@ -143,13 +145,13 @@ def read(conns, quorum, key, cache_expiry):
     version, value = 0, None
     for conn in conns:
         try:
-            rows = list(conn.execute(
+            rows = list(conn.execute(sqlalchemy.text(
                 '''select version, value from paxos
-                   where key=? and version > ? and
+                   where `key`=:k and version > :v and
                          promised_seq is null and
                          accepted_seq is null
                    order by version desc limit 1
-                ''', key, version))
+                '''), dict(k=key, v=version)))
             if rows:
                 version, value = rows[0]
         except Exception:
@@ -163,23 +165,25 @@ def read(conns, quorum, key, cache_expiry):
     for conn in conns:
         try:
             trans = conn.begin()
-            n = list(conn.execute('''select count(*) from paxos
-                                     where key=? and version=? and
-                                           promised_seq is null and
-                                           accepted_seq is null
-                                  ''', key, version))[0][0]
+            n = list(conn.execute(sqlalchemy.text(
+                '''select count(*) from paxos
+                   where `key`=:k and version=:v and
+                         promised_seq is null and
+                         accepted_seq is null
+                '''), dict(k=key, v=version)))[0][0]
             if 1 == n:
                 count += 1
                 trans.rollback()
                 continue
 
-            conn.execute('delete from paxos where key=? and version<=?',
-                         key, version)
-            result = conn.execute(
+            conn.execute(sqlalchemy.text(
+                'delete from paxos where `key`=:k and version<=:v'),
+                dict(k=key, v=version))
+            result = conn.execute(sqlalchemy.text(
                 '''insert into paxos
-                   (key,version,promised_seq,accepted_seq,value)
-                   values(?,?,null,null,?)
-                ''', key, version, value)
+                   (`key`,version,promised_seq,accepted_seq,value)
+                   values(:k,:ver,null,null,:val)
+                '''), dict(k=key, ver=version, val=value))
             trans.commit()
 
             if 1 == result.rowcount:
@@ -205,7 +209,7 @@ class PaxosTable():
             meta = sqlalchemy.MetaData()
             sqlalchemy.Table(
                 'paxos', meta,
-                sqlalchemy.Column('key', sqlalchemy.Text),
+                sqlalchemy.Column('key', sqlalchemy.String(1000)),
                 sqlalchemy.Column('version', sqlalchemy.Integer),
                 sqlalchemy.Column('promised_seq', sqlalchemy.Integer),
                 sqlalchemy.Column('accepted_seq', sqlalchemy.Integer),
