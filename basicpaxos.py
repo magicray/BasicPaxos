@@ -167,42 +167,57 @@ def read(conns, quorum, key, cache_expiry):
     valuehash = None
 
     # Find out latest version for this key
-    version, value = 0, None
+    versions = list()
     for conn in conns:
         try:
             rows = list(conn.execute(sqlalchemy.text(
-                '''select version, valueblob from paxostable
-                   where keyhash=:keyhash and version > :version and
-                         promised_seq is null and
-                         accepted_seq is null
-                   order by version desc limit 1
-                '''), dict(keyhash=keyhash, version=version)))
-            if rows:
-                version, value = rows[0]
+                '''select max(version) from paxostable
+                   where keyhash=:keyhash and
+                         promised_seq is null and accepted_seq is null
+                ''').params(keyhash=keyhash)))
+
+            if rows and rows[0][0]:
+                versions.append((rows[0][0], conn))
+            else:
+                versions.append((0, conn))
         except Exception:
             pass
+
+    if not versions:
+        return dict(status='not-found')
+
+    version = max([v for v, c in versions])
 
     if 0 == version:
         return dict(status='not-found')
 
-    # Update the node missing the latest version of the value
+    for ver, conn in versions:
+        if ver == version:
+            try:
+                value = list(conn.execute(sqlalchemy.text(
+                    '''select valueblob from paxostable
+                       where keyhash=:keyhash and version=:version and
+                             promised_seq is null and accepted_seq is null
+                    ''').params(keyhash=keyhash, version=version)))[0][0]
+                break
+            except Exception:
+                pass
+
+    valuehash = hashlib.sha256(value).hexdigest()
+
     count = 0
-    for conn in conns:
+    for ver, conn in versions:
+        if ver == version:
+            count += 1
+            continue
+
         try:
             trans = conn.begin()
-            n = list(conn.execute(sqlalchemy.text(
-                '''select count(*) from paxostable
-                   where keyhash=:keyhash and version=:version and
-                         promised_seq is null and
-                         accepted_seq is null
-                ''').params(keyhash=keyhash, version=version)))[0][0]
-            if 1 == n:
-                count += 1
-                trans.rollback()
-                continue
 
-            if not valuehash:
-                valuehash = hashlib.sha256(value).hexdigest()
+            conn.execute(sqlalchemy.text(
+                '''delete from paxostable
+                   where keyhash=:keyhash and version=:version
+                ''').params(keyhash=keyhash, version=version))
 
             result = conn.execute(sqlalchemy.text(
                 '''insert into paxostable
@@ -212,6 +227,7 @@ def read(conns, quorum, key, cache_expiry):
                           :keyblob,:valueblob)
                 ''').params(keyhash=keyhash, version=version,
                             valuehash=valuehash, keyblob=key, valueblob=value))
+
             trans.commit()
 
             if 1 == result.rowcount:
