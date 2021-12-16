@@ -16,8 +16,19 @@ def paxos(conns, quorum, key, version, value):
     # Promise Phase
     success = list()
     random.shuffle(conns)
+    existing_version = 0
     for conn in conns:
         try:
+            # Find out the max version
+            rows = list(conn.execute(sqlalchemy.text(
+                '''select max(version) from paxostable
+                   where keyhash=:keyhash and
+                         promised_seq is null and accepted_seq is null
+                ''').params(keyhash=keyhash)))
+
+            if rows and rows[0][0] and rows[0][0] > existing_version:
+                existing_version = rows[0][0]
+
             # Insert a row, if does not exist already
             conn.execute(sqlalchemy.text(
                 '''insert into paxostable
@@ -26,6 +37,9 @@ def paxos(conns, quorum, key, version, value):
                 ''').params(keyhash=keyhash, version=version, keyblob=key))
         except Exception:
             pass
+
+        if version != existing_version + 1:
+            return dict(status='invalid-version', version=existing_version)
 
         try:
             trans = conn.begin()
@@ -112,14 +126,6 @@ def paxos(conns, quorum, key, version, value):
     random.shuffle(conns)
     for conn in conns:
         try:
-            trans = conn.begin()
-
-            # Old versions of this key are not needed anymore
-            conn.execute(sqlalchemy.text(
-                '''delete from paxostable
-                   where keyhash=:keyhash and version < :version
-                ''').params(keyhash=keyhash, version=version))
-
             # Mark this value as learned, iff, this node participated in both
             # the promise and accept phase of this round.
             # promised_seq == accepted_seq == seq.
@@ -136,7 +142,6 @@ def paxos(conns, quorum, key, version, value):
                          promised_seq=:seq and accepted_seq=:seq
                 ''').params(keyhash=keyhash, version=version, seq=seq))
 
-            trans.commit()
             if 1 == result.rowcount:
                 success.append(True)
 
@@ -199,10 +204,6 @@ def read(conns, quorum, key, cache_expiry):
             if not valuehash:
                 valuehash = hashlib.sha256(value).hexdigest()
 
-            conn.execute(sqlalchemy.text(
-                '''delete from paxostable
-                   where keyhash=:keyhash and version<=:version
-                ''').params(keyhash=keyhash, version=version))
             result = conn.execute(sqlalchemy.text(
                 '''insert into paxostable
                    (keyhash,version,promised_seq,accepted_seq,valuehash,
