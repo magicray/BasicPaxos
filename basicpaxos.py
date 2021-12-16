@@ -11,7 +11,7 @@ def paxos(conns, quorum, key, version, value):
 
     seq = int(time.time())  # Paxos Seq
 
-    keyhash = hashlib.sha256(key).digest()
+    keyhash = hashlib.sha256(key).hexdigest()
 
     # Promise Phase
     success = list()
@@ -75,7 +75,7 @@ def paxos(conns, quorum, key, version, value):
         if accepted_seq > proposal[0]:
             proposal = (accepted_seq, value)
 
-    valuehash = hashlib.sha256(proposal[1]).digest()
+    valuehash = hashlib.sha256(proposal[1]).hexdigest()
 
     # Accept Phase
     success = list()
@@ -158,7 +158,7 @@ def paxos(conns, quorum, key, version, value):
 
 
 def read(conns, quorum, key, cache_expiry):
-    keyhash = hashlib.sha256(key).digest()
+    keyhash = hashlib.sha256(key).hexdigest()
     valuehash = None
 
     # Find out latest version for this key
@@ -197,7 +197,7 @@ def read(conns, quorum, key, cache_expiry):
                 continue
 
             if not valuehash:
-                valuehash = hashlib.sha256(value).digest()
+                valuehash = hashlib.sha256(value).hexdigest()
 
             conn.execute(sqlalchemy.text(
                 '''delete from paxostable
@@ -236,11 +236,11 @@ class PaxosTable():
             meta = sqlalchemy.MetaData()
             sqlalchemy.Table(
                 'paxostable', meta,
-                sqlalchemy.Column('keyhash', sqlalchemy.LargeBinary(32)),
+                sqlalchemy.Column('keyhash', sqlalchemy.VARCHAR(64)),
                 sqlalchemy.Column('version', sqlalchemy.Integer),
                 sqlalchemy.Column('promised_seq', sqlalchemy.Integer),
                 sqlalchemy.Column('accepted_seq', sqlalchemy.Integer),
-                sqlalchemy.Column('valuehash', sqlalchemy.LargeBinary(32)),
+                sqlalchemy.Column('valuehash', sqlalchemy.VARCHAR(64)),
                 sqlalchemy.Column('keyblob', sqlalchemy.LargeBinary),
                 sqlalchemy.Column('valueblob', sqlalchemy.LargeBinary),
                 sqlalchemy.PrimaryKeyConstraint('keyhash', 'version'))
