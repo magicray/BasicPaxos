@@ -1,6 +1,7 @@
 import sys
 import time
 import random
+import hashlib
 import sqlalchemy
 
 
@@ -10,6 +11,8 @@ def paxos(conns, quorum, key, version, value):
 
     seq = int(time.time())  # Paxos Seq
 
+    keyhash = hashlib.sha256(key).digest()
+
     # Promise Phase
     success = list()
     random.shuffle(conns)
@@ -17,9 +20,10 @@ def paxos(conns, quorum, key, version, value):
         try:
             # Insert a row, if does not exist already
             conn.execute(sqlalchemy.text(
-                '''insert into paxos(`key`,version,promised_seq,accepted_seq)
-                   values(:k,:v,0,0)
-                '''), dict(k=key, v=version))
+                '''insert into paxostable
+                   (keyhash,version,promised_seq,accepted_seq,keyblob)
+                   values(:keyhash,:version,0,0,:keyblob)
+                ''').params(keyhash=keyhash, version=version, keyblob=key))
         except Exception:
             pass
 
@@ -29,9 +33,11 @@ def paxos(conns, quorum, key, version, value):
             # Get the information from the old paxos round
             promised_seq, accepted_seq, accepted_value = list(
                 conn.execute(sqlalchemy.text(
-                    '''select promised_seq,accepted_seq,value
-                       from paxos where `key`=:k and version=:v
-                    '''), dict(k=key, v=version)))[0]
+                    '''select promised_seq,accepted_seq,valueblob
+                       from paxostable
+                       where keyhash=:keyhash and version=:version and
+                             keyblob is not null
+                    ''').params(keyhash=keyhash, version=version)))[0]
 
             # Value for this key,version has already been learned
             if promised_seq is None and accepted_seq is None:
@@ -45,9 +51,10 @@ def paxos(conns, quorum, key, version, value):
 
             # Record seq to reject any old stray paxos rounds
             conn.execute(sqlalchemy.text(
-                '''update paxos set promised_seq=:s
-                   where `key`=:k and version=:v
-                '''), dict(s=seq, k=key, v=version))
+                '''update paxostable set promised_seq=:seq
+                   where keyhash=:keyhash and version=:version and
+                         keyblob is not null
+                ''').params(seq=seq, keyhash=keyhash, version=version))
 
             trans.commit()
 
@@ -68,6 +75,8 @@ def paxos(conns, quorum, key, version, value):
         if accepted_seq > proposal[0]:
             proposal = (accepted_seq, value)
 
+    valuehash = hashlib.sha256(proposal[1]).digest()
+
     # Accept Phase
     success = list()
     random.shuffle(conns)
@@ -80,9 +89,14 @@ def paxos(conns, quorum, key, version, value):
             # Paxos would allow if seq >= promised_seq, but we don't allow
             # to minimize testing effort for this valid, but rare case.
             result = conn.execute(sqlalchemy.text(
-                '''update paxos set accepted_seq=:s, value=:val
-                   where `key`=:k and version=:ver and promised_seq=:s
-                '''), dict(s=seq, val=proposal[1], k=key, ver=version))
+                '''update paxostable
+                   set accepted_seq=:seq, valuehash=:valuehash,
+                       valueblob=:valueblob
+                   where keyhash=:keyhash and version=:version and
+                         promised_seq=:seq and keyblob is not null
+                ''').params(seq=seq,
+                            valuehash=valuehash, valueblob=proposal[1],
+                            keyhash=keyhash, version=version))
 
             if 1 == result.rowcount:
                 success.append(True)
@@ -102,8 +116,9 @@ def paxos(conns, quorum, key, version, value):
 
             # Old versions of this key are not needed anymore
             conn.execute(sqlalchemy.text(
-                'delete from paxos where `key`=:k and version < :v'),
-                dict(k=key, v=version))
+                '''delete from paxostable
+                   where keyhash=:keyhash and version < :version
+                ''').params(keyhash=keyhash, version=version))
 
             # Mark this value as learned, iff, this node participated in both
             # the promise and accept phase of this round.
@@ -114,10 +129,12 @@ def paxos(conns, quorum, key, version, value):
             # value accepted in ACCEPT phase as learned, and hence we need
             # the check to ensure this node participated in the promise/accept
             result = conn.execute(sqlalchemy.text(
-                '''update paxos set promised_seq=null, accepted_seq=null
-                   where `key`=:k and version=:v and value is not null and
-                         promised_seq=:s and accepted_seq=:s
-                '''), dict(k=key, v=version, s=seq))
+                '''update paxostable set promised_seq=null, accepted_seq=null
+                   where keyhash=:keyhash and version=:version and
+                         keyblob is not null and
+                         valuehash is not null and valueblob is not null and
+                         promised_seq=:seq and accepted_seq=:seq
+                ''').params(keyhash=keyhash, version=version, seq=seq))
 
             trans.commit()
             if 1 == result.rowcount:
@@ -141,17 +158,20 @@ def paxos(conns, quorum, key, version, value):
 
 
 def read(conns, quorum, key, cache_expiry):
+    keyhash = hashlib.sha256(key).digest()
+    valuehash = None
+
     # Find out latest version for this key
     version, value = 0, None
     for conn in conns:
         try:
             rows = list(conn.execute(sqlalchemy.text(
-                '''select version, value from paxos
-                   where `key`=:k and version > :v and
+                '''select version, valueblob from paxostable
+                   where keyhash=:keyhash and version > :version and
                          promised_seq is null and
                          accepted_seq is null
                    order by version desc limit 1
-                '''), dict(k=key, v=version)))
+                '''), dict(keyhash=keyhash, version=version)))
             if rows:
                 version, value = rows[0]
         except Exception:
@@ -166,24 +186,31 @@ def read(conns, quorum, key, cache_expiry):
         try:
             trans = conn.begin()
             n = list(conn.execute(sqlalchemy.text(
-                '''select count(*) from paxos
-                   where `key`=:k and version=:v and
+                '''select count(*) from paxostable
+                   where keyhash=:keyhash and version=:version and
                          promised_seq is null and
                          accepted_seq is null
-                '''), dict(k=key, v=version)))[0][0]
+                ''').params(keyhash=keyhash, version=version)))[0][0]
             if 1 == n:
                 count += 1
                 trans.rollback()
                 continue
 
+            if not valuehash:
+                valuehash = hashlib.sha256(value).digest()
+
             conn.execute(sqlalchemy.text(
-                'delete from paxos where `key`=:k and version<=:v'),
-                dict(k=key, v=version))
+                '''delete from paxostable
+                   where keyhash=:keyhash and version<=:version
+                ''').params(keyhash=keyhash, version=version))
             result = conn.execute(sqlalchemy.text(
-                '''insert into paxos
-                   (`key`,version,promised_seq,accepted_seq,value)
-                   values(:k,:ver,null,null,:val)
-                '''), dict(k=key, ver=version, val=value))
+                '''insert into paxostable
+                   (keyhash,version,promised_seq,accepted_seq,valuehash,
+                    keyblob,valueblob)
+                   values(:keyhash,:version,null,null,:valuehash,
+                          :keyblob,:valueblob)
+                ''').params(keyhash=keyhash, version=version,
+                            valuehash=valuehash, keyblob=key, valueblob=value))
             trans.commit()
 
             if 1 == result.rowcount:
@@ -208,13 +235,15 @@ class PaxosTable():
         for s in servers:
             meta = sqlalchemy.MetaData()
             sqlalchemy.Table(
-                'paxos', meta,
-                sqlalchemy.Column('key', sqlalchemy.String(1000)),
+                'paxostable', meta,
+                sqlalchemy.Column('keyhash', sqlalchemy.LargeBinary(32)),
                 sqlalchemy.Column('version', sqlalchemy.Integer),
                 sqlalchemy.Column('promised_seq', sqlalchemy.Integer),
                 sqlalchemy.Column('accepted_seq', sqlalchemy.Integer),
-                sqlalchemy.Column('value', sqlalchemy.LargeBinary),
-                sqlalchemy.PrimaryKeyConstraint('key', 'version'))
+                sqlalchemy.Column('valuehash', sqlalchemy.LargeBinary(32)),
+                sqlalchemy.Column('keyblob', sqlalchemy.LargeBinary),
+                sqlalchemy.Column('valueblob', sqlalchemy.LargeBinary),
+                sqlalchemy.PrimaryKeyConstraint('keyhash', 'version'))
 
             self.engines[s] = sqlalchemy.create_engine(s)
             meta.create_all(self.engines[s])
@@ -255,6 +284,7 @@ def main():
     with open(server_file) as fd:
         servers = [s.strip() for s in fd.read().split('\n') if s.strip()]
 
+    key = key.encode()
     ptab = PaxosTable(servers)
 
     if value:
