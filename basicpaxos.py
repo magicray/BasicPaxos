@@ -13,10 +13,9 @@ def paxos(conns, quorum, key, version, value):
 
     keyhash = hashlib.sha256(key).hexdigest()
 
-    # Promise Phase
-    success = list()
-    random.shuffle(conns)
+    # Ensure only next version number is being used
     existing_version = 0
+    random.shuffle(conns)
     for conn in conns:
         try:
             # Find out the max version
@@ -28,7 +27,17 @@ def paxos(conns, quorum, key, version, value):
 
             if rows and rows[0][0] and rows[0][0] > existing_version:
                 existing_version = rows[0][0]
+        except Exception:
+            pass
 
+    if version != existing_version + 1:
+        return dict(status='invalid-version', version=existing_version)
+
+    # Promise Phase
+    success = list()
+    random.shuffle(conns)
+    for conn in conns:
+        try:
             # Insert a row, if does not exist already
             conn.execute(sqlalchemy.text(
                 '''insert into paxostable
@@ -37,9 +46,6 @@ def paxos(conns, quorum, key, version, value):
                 ''').params(keyhash=keyhash, version=version, keyblob=key))
         except Exception:
             pass
-
-        if version != existing_version + 1:
-            return dict(status='invalid-version', version=existing_version)
 
         try:
             trans = conn.begin()
@@ -108,13 +114,12 @@ def paxos(conns, quorum, key, version, value):
                        valueblob=:valueblob
                    where keyhash=:keyhash and version=:version and
                          promised_seq=:seq and keyblob is not null
-                ''').params(seq=seq,
-                            valuehash=valuehash, valueblob=proposal[1],
+                ''').params(seq=seq, valuehash=valuehash,
+                            valueblob=proposal[1],
                             keyhash=keyhash, version=version))
 
             if 1 == result.rowcount:
                 success.append(True)
-
         except Exception:
             pass
 
@@ -126,6 +131,14 @@ def paxos(conns, quorum, key, version, value):
     random.shuffle(conns)
     for conn in conns:
         try:
+            trans = conn.begin()
+
+            # Remove old versions
+            conn.execute(sqlalchemy.text(
+                '''delete from paxostable
+                   where keyhash=:keyhash and version < :version
+                ''').params(keyhash=keyhash, version=version))
+
             # Mark this value as learned, iff, this node participated in both
             # the promise and accept phase of this round.
             # promised_seq == accepted_seq == seq.
@@ -141,6 +154,8 @@ def paxos(conns, quorum, key, version, value):
                          valuehash is not null and valueblob is not null and
                          promised_seq=:seq and accepted_seq=:seq
                 ''').params(keyhash=keyhash, version=version, seq=seq))
+
+            trans.commit()
 
             if 1 == result.rowcount:
                 success.append(True)
@@ -183,34 +198,27 @@ def read(conns, quorum, key, cache_expiry):
         except Exception:
             pass
 
-    if not versions:
-        return dict(status='not-found')
-
-    version = max([v for v, c in versions])
-
+    version = max([v for v, c in versions]) if versions else 0
     if 0 == version:
         return dict(status='not-found')
 
-    for ver, conn in versions:
-        if ver == version:
-            try:
-                value = list(conn.execute(sqlalchemy.text(
-                    '''select valueblob from paxostable
-                       where keyhash=:keyhash and version=:version and
-                             promised_seq is null and accepted_seq is null
-                    ''').params(keyhash=keyhash, version=version)))[0][0]
-                break
-            except Exception:
-                pass
+    in_sync = [conn for ver, conn in versions if ver == version]
+    out_of_sync = [conn for ver, conn in versions if ver != version]
+
+    for conn in in_sync:
+        try:
+            value = list(conn.execute(sqlalchemy.text(
+                '''select valueblob from paxostable
+                   where keyhash=:keyhash and version=:version and
+                         promised_seq is null and accepted_seq is null
+                ''').params(keyhash=keyhash, version=version)))[0][0]
+            break
+        except Exception:
+            pass
 
     valuehash = hashlib.sha256(value).hexdigest()
 
-    count = 0
-    for ver, conn in versions:
-        if ver == version:
-            count += 1
-            continue
-
+    for conn in out_of_sync:
         try:
             trans = conn.begin()
 
@@ -231,16 +239,17 @@ def read(conns, quorum, key, cache_expiry):
             trans.commit()
 
             if 1 == result.rowcount:
-                count += 1
+                in_sync.append(conn)
         except Exception:
             pass
 
     # We do not have a majority with the latest value
-    if count < quorum:
-        return dict(status='no-quorum', replicas=count)
+    if len(in_sync) < quorum:
+        return dict(status='no-quorum', replicas=len(in_sync))
 
     # All good
-    return dict(status='ok', version=version, replicas=count, value=value)
+    return dict(status='ok', version=version,
+                replicas=len(in_sync), value=value)
 
 
 class PaxosTable():
